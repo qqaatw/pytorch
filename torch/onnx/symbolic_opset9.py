@@ -2252,6 +2252,7 @@ def log10(g, self):
 
 def pow(g, self, exponent):
     f_dtype = self_dtype = self.type().scalarType()
+    exponent_dtype = exponent.type().scalarType()
     if not symbolic_helper._is_fp(self):
         f_dtype = "Float"
         self = g.op("Cast", self, to_i=symbolic_helper.cast_pytorch_to_onnx[f_dtype])
@@ -2260,6 +2261,11 @@ def pow(g, self, exponent):
             "Cast", exponent, to_i=symbolic_helper.cast_pytorch_to_onnx[f_dtype]
         )
     pow = g.op("Pow", self, exponent)
+
+    if f_dtype != self_dtype and exponent_dtype == self_dtype:
+        # The dtypes of self and exponent are integer; thus, cast back to integer.
+        pow = g.op("Cast", pow, to_i=symbolic_helper.cast_pytorch_to_onnx[self_dtype])
+
     return pow
 
 
