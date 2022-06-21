@@ -175,5 +175,54 @@ TORCH_IMPL_FUNC(log1p_out_mps) (const Tensor& self, const Tensor& output)
     }
 }
 
+TORCH_IMPL_FUNC(lgamma_out_mps) (const Tensor& self, const Tensor& output)
+{
+    using namespace mps;
+    if (!output.is_same_size(self)) {
+      output.resize_(self.sizes());
+    }
+    struct CachedGraph : public MPSCachedGraph
+    {
+      CachedGraph(MPSGraph *graph) : MPSCachedGraph(graph) {}
+      MPSGraphTensor *inputTensor = nil, *outputTensor = nil;
+    };
+    MPSGraphCache* cache_ = MPSGraphCache::getInstance();
+    @autoreleasepool {
+      string key = string("lgamma_out_mps") + getTensorsStringKey({self});
+      CachedGraph* cachedGraph = static_cast<CachedGraph *>(cache_->LookUp(key));
+
+      if(!cachedGraph) {
+        MPSCachedGraph *tmpCachedGraph = cache_->CreateCachedGraph(key, ^ MPSCachedGraph* () {
+          CachedGraph *newCachedGraph = nil;
+          @autoreleasepool {
+            MPSGraph* mpsGraph = make_mps_graph();
+            newCachedGraph = new CachedGraph(mpsGraph);
+            newCachedGraph->inputTensor = mpsGraphRankedPlaceHolder(mpsGraph, self);
+              MPSGraphTensor* oneTensor = [mpsGraph constantWithScalar:1.0
+                                                          shape:getMPSShape(self)
+                                                        dataType:mps::getMPSDataType(self.scalar_type())];
+              MPSGraphTensor* addedTensor = [mpsGraph additionWithPrimaryTensor:newCachedGraph->inputTensor
+                                                          secondaryTensor:oneTensor
+                                                                    name:nil];
+            newCachedGraph->outputTensor = [mpsGraph logarithmWithTensor:addedTensor
+                                                                    name:nil];
+          }
+          return newCachedGraph;
+        });
+        cachedGraph = static_cast<CachedGraph *>(tmpCachedGraph);
+      }
+
+      Placeholder selfPlaceholder = Placeholder(cachedGraph->inputTensor, self);
+      Placeholder outputPlaceholder = Placeholder(cachedGraph->outputTensor, output);
+      NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feeds = @{
+        selfPlaceholder.getMPSGraphTensor() : selfPlaceholder.getMPSGraphTensorData()
+      };
+      NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* results = @{
+        outputPlaceholder.getMPSGraphTensor() : outputPlaceholder.getMPSGraphTensorData()
+      };
+      runMPSGraph(getCurrentMPSStream(), cachedGraph->graph(), feeds, results);
+    }
+}
+
 } // namespace native
 } // namespace at
