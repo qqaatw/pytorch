@@ -610,6 +610,10 @@ TORCH_IMPL_FUNC(cat_out_mps)
     return;
   }
 
+  auto result_type_ = result_type(inputs);
+  auto temp_type_ = result_type_ == ScalarType::Bool ? ScalarType::Long : result_type_;
+  auto out_ = at::empty_like(out, temp_type_);
+
   // Get stream
   MPSStream* stream = getCurrentMPSStream();
 
@@ -639,16 +643,19 @@ TORCH_IMPL_FUNC(cat_out_mps)
 
           // Create placeholders
           MPSGraphTensor* inputMPSGraphTensors[inputs.size()];
+          std::cout << inputs.size() << std::endl;
+          std::cout << sizeof(inputMPSGraphTensors) << std::endl;
+          std::cout << sizeof(MPSGraphTensor*) << std::endl;
 
           for(int i = 0; i < inputs.size(); i++)
-            inputMPSGraphTensors[i] = mpsGraphUnrankedPlaceHolder(mpsGraph, getMPSDataType(result_type(inputs)));
+            inputMPSGraphTensors[i] = mpsGraphUnrankedPlaceHolder(mpsGraph, getMPSDataType(temp_type_));
 
           auto inputTensorsArray = [NSArray arrayWithObjects:inputMPSGraphTensors
                                                        count:inputs.size()];
           // Use concatTensors to concatenate
-          MPSGraphTensor* outputTensor = [mpsGraph concatTensors:inputTensorsArray
-                                                       dimension:dimension // Maybe convert this from int64_t -> int32
-                                                            name:nil];
+          MPSGraphTensor* outputTensor = inputTensorsArray[1];//[mpsGraph concatTensors:inputTensorsArray
+                                         //              dimension:dimension // Maybe convert this from int64_t -> int32
+                                         //                   name:nil];
 
           newCachedGraph->inputMPSGraphTensors_ = (MPSGraphTensor**)malloc(inputs.size() * sizeof(MPSGraphTensor*));
 
@@ -664,12 +671,12 @@ TORCH_IMPL_FUNC(cat_out_mps)
     std::vector<Placeholder> inputPlaceholders;
     int i = 0;
     for(const Tensor& tensor : materialized_inputs) {
-      Placeholder currentInputPlaceholder = Placeholder(cachedGraph->inputMPSGraphTensors_[i], tensor);
+      Placeholder currentInputPlaceholder = Placeholder(cachedGraph->inputMPSGraphTensors_[i], tensor.to(temp_type_).contiguous());
       inputPlaceholders.push_back(currentInputPlaceholder);
       i++;
     }
 
-    Placeholder outputPlaceholder = Placeholder(cachedGraph->outputTensor_, out);
+    Placeholder outputPlaceholder = Placeholder(cachedGraph->outputTensor_, out_);
 
     NSMutableDictionary *feeds = [[NSMutableDictionary new] autorelease];
     for (int i = 0; i < inputs.size(); i++) {
@@ -681,6 +688,7 @@ TORCH_IMPL_FUNC(cat_out_mps)
 
     mps::runMPSGraph(stream, cachedGraph->graph(), feeds, results);
   }
+  out.copy_(out_.to(result_type_));
 
 }
 
