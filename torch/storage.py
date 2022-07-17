@@ -118,7 +118,7 @@ class _StorageBase(object):
             return self
 
     def mps(self):
-        """Returns a CPU copy of this storage if it's not already on the CPU"""
+        """Returns a MPS copy of this storage if it's not already on the MPS"""
         if self.device.type != 'mps':
             return torch._UntypedStorage(self.size(), device="mps").copy_(self, False)
         else:
