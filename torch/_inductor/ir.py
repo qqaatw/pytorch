@@ -279,6 +279,7 @@ def ops_wrapper(name: str) -> Callable[..., OpsValue]:
 
 
 def inverse_reorder(order: Sequence[int]) -> Callable[[Sequence[_T]], Sequence[_T]]:
+    """Return a function that maps ordered `index` back to the original state"""
     inv_order = dict(zip(order, range(len(order))))
 
     def reindex(index: Sequence[_T]) -> Sequence[_T]:
@@ -289,6 +290,8 @@ def inverse_reorder(order: Sequence[int]) -> Callable[[Sequence[_T]], Sequence[_
 
 
 def same_reorder(order: Sequence[int]) -> Callable[[Sequence[_T]], Sequence[_T]]:
+    """Return a function that order `index` based on `order`"""
+
     def reindex(index: Sequence[_T]) -> Sequence[_T]:
         assert len(index) == len(order)
         return [index[order[i]] for i in range(len(index))]
@@ -5074,6 +5077,7 @@ class ComputedBuffer(OperationBuffer):
         LoopBody,
         tuple[list[Expr], list[Expr]],
     ]:
+        # args: list[sequence[index] = varname]
         args, var_ranges = dependencies.index_vars_squeeze(
             self.get_pointwise_size(), self.get_reduction_size(), prefix="q"
         )
@@ -5172,6 +5176,7 @@ class ComputedBuffer(OperationBuffer):
             Callable[[Sequence[int]], Sequence[int]],
             Callable[[Sequence[int]], Sequence[int]],
         ]:
+            # reordered_size
             newsizes, reindex0, reindex1 = self._apply_loop_reordering(
                 x_vars, support_vars, sizes, memory_addrs
             )

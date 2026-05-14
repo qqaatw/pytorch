@@ -626,6 +626,7 @@ def var_builder(prefix: str) -> tuple[VarRanges, Callable[[sympy.Expr], sympy.Sy
     var_ranges: VarRanges = {}
 
     def add_var(length: sympy.Expr) -> sympy.Symbol:
+        """Name a length and add it to the name/length mapping"""
         v = sympy_index_symbol(f"{prefix}{next(cnt)}")
         var_ranges[v] = length
         return v
@@ -646,9 +647,12 @@ def index_vars_squeeze(
 ) -> tuple[list[Sequence[sympy.Expr]], VarRanges]:
     from .ir import SqueezeView
 
+    # (name/length mapping, setter that returns a sympy symbol)
     var_ranges, add_var = var_builder(prefix)
+
     args: list[Sequence[sympy.Expr]] = []
     for size in argsizes:
+        # (sizes for an arg minus the (1)s, fn ruturning a mapping [original_not_one_index, corresponding size symbol] with original one indices being size 0)
         new_size, reindex = SqueezeView.squeezer(size)
         args.append(reindex(list(map(add_var, new_size))))
     return args, var_ranges
