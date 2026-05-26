@@ -1158,14 +1158,14 @@ class TestSerialization(TestCase, SerializationMixin):
     def test_serialization_zipfile(self, weights_only):
         data = self._test_serialization_data()
 
-        def test(name_or_buffer):
-            torch.save(data, name_or_buffer)
+        def test(name_or_buffer, data_override=None):
+            torch.save(data if data_override is None else data_override, name_or_buffer)
 
             if hasattr(name_or_buffer, 'seek'):
                 name_or_buffer.seek(0)
 
             result = torch.load(name_or_buffer, weights_only=weights_only)
-            self.assertEqual(result, data)
+            self.assertEqual(result, data if data_override is None else data_override)
 
         with tempfile.NamedTemporaryFile() as f:
             test(f)
@@ -1177,6 +1177,11 @@ class TestSerialization(TestCase, SerializationMixin):
             with TemporaryDirectoryName(suffix='\u975eASCII\u30d1\u30b9') as dname:
                 with TemporaryFileName(dir=dname) as fname:
                     test(fname)
+
+                    if not weights_only:
+                        # https://github.com/pytorch/pytorch/issues/185098
+                        data_override = torch.rand(200, 2048, 2048, dtype=torch.float32)  # ~3.13 GiB storage
+                        test(fname, data_override)
 
         test(io.BytesIO())
 
