@@ -384,6 +384,17 @@ AOTI_TORCH_EXPORT AOTITorchError torch_device_to_pyobject(
  */
 #if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
 
+struct HeaderOnlyScalarData;
+struct HeaderOnlySymbolicOpaque;
+using HeaderOnlySymbolicHandle = HeaderOnlySymbolicOpaque*;
+
+// Objects are released in the module that allocated them.
+AOTI_TORCH_EXPORT AOTITorchError
+torch_delete_header_only_scalar_object(const HeaderOnlyScalarData* scalar);
+// Consumes an owning handle. Scalar copies share ownership in the extension.
+AOTI_TORCH_EXPORT AOTITorchError
+torch_delete_symbolic_object(HeaderOnlySymbolicHandle symbolic);
+
 // Returns whether torch.set_warn_always(True) is in effect.
 AOTI_TORCH_EXPORT bool torch_is_warn_always_enabled();
 

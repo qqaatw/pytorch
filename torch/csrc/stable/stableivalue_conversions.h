@@ -9,6 +9,7 @@
 #include <torch/headeronly/core/DeviceType.h>
 #include <torch/headeronly/core/Layout.h>
 #include <torch/headeronly/core/MemoryFormat.h>
+#include <torch/headeronly/core/Scalar.h>
 #include <torch/headeronly/core/ScalarType.h>
 #include <torch/headeronly/core/enum_tag.h>
 #include <torch/headeronly/macros/Macros.h>
@@ -35,10 +36,34 @@ inline constexpr bool is_std_vector_v = false;
 template <typename T>
 inline constexpr bool is_std_vector_v<std::vector<T>> = true;
 
+template <typename T>
+inline constexpr bool contains_header_only_scalar_v = false;
+
+template <>
+inline constexpr bool
+    contains_header_only_scalar_v<torch::headeronly::HeaderOnlyScalar> = true;
+
+template <typename T>
+inline constexpr bool contains_header_only_scalar_v<std::optional<T>> =
+    contains_header_only_scalar_v<T>;
+
+template <typename T>
+inline constexpr bool contains_header_only_scalar_v<std::vector<T>> =
+    contains_header_only_scalar_v<T>;
+
+template <typename T>
+inline constexpr bool
+    contains_header_only_scalar_v<torch::headeronly::HeaderOnlyArrayRef<T>> =
+        contains_header_only_scalar_v<T>;
+
+template <typename T>
+inline constexpr bool borrows_scalar_storage_v =
+    contains_header_only_scalar_v<T> && !is_header_only_array_ref_v<T>;
+
 // forward declare so that the from/to() implementations in the detail
 // namespace of library.h where the real work is done can compile.
 template <typename T>
-StableIValue from(T val);
+StableIValue from(const T& val);
 template <typename T>
 T to(StableIValue val);
 
@@ -278,6 +303,18 @@ struct FromImpl<std::optional<T>> {
 #endif
   }
 };
+
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
+template <>
+struct FromImpl<torch::headeronly::HeaderOnlyScalar> {
+  static StableIValue call(
+      const torch::headeronly::HeaderOnlyScalar& value,
+      [[maybe_unused]] uint64_t extension_build_version,
+      [[maybe_unused]] bool is_internal) {
+    return torch::stable::detail::from(&value.data());
+  }
+};
+#endif // TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
 
 // Specialization for torch::stable::Tensor => StableIValue
 // Returns a new owning reference of the underlying Tensor.
@@ -654,6 +691,45 @@ struct ToImpl<std::optional<T>> {
   }
 };
 
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
+template <>
+struct ToImpl<torch::headeronly::HeaderOnlyScalar> {
+  static torch::headeronly::HeaderOnlyScalar call(
+      StableIValue value,
+      [[maybe_unused]] uint64_t extension_build_version,
+      [[maybe_unused]] bool is_internal) {
+    using Scalar = torch::headeronly::HeaderOnlyScalar;
+    const auto* data =
+        torch::stable::detail::to<const HeaderOnlyScalarData*>(value);
+    STD_TORCH_CHECK(data != nullptr, "Expected non-null Scalar data");
+    auto owner = std::unique_ptr<
+        const HeaderOnlyScalarData,
+        void (*)(const HeaderOnlyScalarData*)>(
+        data, [](const HeaderOnlyScalarData* scalar) {
+          if (scalar->destroy != nullptr) {
+            scalar->destroy(scalar);
+          }
+        });
+    if (data->kind >= Scalar::Kind::SymInt &&
+        data->kind <= Scalar::Kind::SymBool) {
+      STD_TORCH_CHECK(
+          data->flags & HeaderOnlyScalarData::OwnsSymbolic,
+          "Cannot adopt a borrowed symbolic Scalar");
+      STD_TORCH_CHECK(
+          data->value.symbolic != nullptr,
+          "Symbolic Scalar ownership was already transferred");
+      auto* handle = std::exchange(data->value.symbolic, nullptr);
+      auto symbolic = std::shared_ptr<HeaderOnlySymbolicOpaque>(
+          handle, [](HeaderOnlySymbolicOpaque* owned) {
+            STABLE_TORCH_ERROR_CODE_CHECK(torch_delete_symbolic_object(owned));
+          });
+      return Scalar::fromSymbolic(data->kind, std::move(symbolic));
+    }
+    return Scalar::fromData(*data);
+  }
+};
+#endif // TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
+
 // Specialization for StableIValue => torch::stable::Tensor
 // The resulting stable::Tensor steals ownership of the input's
 // underlying AtenTensorHandle.
@@ -954,10 +1030,17 @@ struct ToImpl<Tag> {
 // The non-private versions will be used by the extension or headers that
 // the extension includes.
 template <typename T>
-inline StableIValue from(T val) {
+inline StableIValue from(const T& val) {
+  // Scalar inputs borrow storage, including when nested in a list or optional.
+  // Keep the input alive and unmodified until dispatch returns.
   return detail::FromImpl<T>::call(
       val, aoti_torch_abi_version(), /*is_internal=*/false);
 }
+
+template <
+    typename T,
+    std::enable_if_t<borrows_scalar_storage_v<std::remove_cv_t<T>>, int> = 0>
+StableIValue from(T&&) = delete;
 
 template <typename T>
 inline StableIValue from(const std::optional<T>& val) {
@@ -982,6 +1065,9 @@ inline T to(StableIValue val) {
 // These are used in libtorch
 template <typename T>
 inline StableIValue _from(T val, uint64_t extension_build_version) {
+  static_assert(
+      !borrows_scalar_storage_v<T>,
+      "Scalar inputs must be borrowed by reference");
   return detail::FromImpl<T>::call(
       val, extension_build_version, /*is_internal=*/true);
 }
@@ -1007,6 +1093,131 @@ inline T _to(StableIValue val, uint64_t extension_build_version) {
       val, extension_build_version, /*is_internal=*/true);
 }
 
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
+// Kernel returns outlive the C++ result object and therefore own their storage.
+template <typename T>
+struct ReturnFromImpl {
+  static StableIValue call(const T& value) {
+    return FromImpl<T>::call(value, aoti_torch_abi_version(), false);
+  }
+};
+
+struct OwnedScalarData : HeaderOnlyScalarData {
+  std::shared_ptr<HeaderOnlySymbolicOpaque> symbolic;
+};
+
+template <>
+struct ReturnFromImpl<torch::headeronly::HeaderOnlyScalar> {
+  static StableIValue call(const torch::headeronly::HeaderOnlyScalar& value) {
+    auto data = std::make_unique<OwnedScalarData>();
+    static_cast<HeaderOnlyScalarData&>(*data) = value.data();
+    data->symbolic = value.symbolicOwner();
+    data->destroy = [](const HeaderOnlyScalarData* scalar) {
+      delete static_cast<const OwnedScalarData*>(scalar);
+    };
+    return from(static_cast<const HeaderOnlyScalarData*>(data.release()));
+  }
+
+  static void destroy(StableIValue value) {
+    const auto* data = to<const HeaderOnlyScalarData*>(value);
+    data->destroy(data);
+  }
+};
+
+template <typename T>
+struct ReturnFromImpl<std::optional<T>> {
+  static StableIValue call(const std::optional<T>& value) {
+    if constexpr (!contains_header_only_scalar_v<T>) {
+      return FromImpl<std::optional<T>>::call(
+          value, aoti_torch_abi_version(), false);
+    } else {
+      if (!value.has_value()) {
+        return from(std::nullopt);
+      }
+      StableIValue* data = nullptr;
+      STABLE_TORCH_ERROR_CODE_CHECK(torch_new_stable_ivalue(&data));
+      try {
+        *data = ReturnFromImpl<T>::call(*value);
+      } catch (...) {
+        STABLE_TORCH_ERROR_CODE_CHECK(torch_delete_stable_ivalue(data));
+        throw;
+      }
+      return from(data);
+    }
+  }
+
+  static void destroy(StableIValue value) {
+    auto* data = to<StableIValue*>(value);
+    if (data != nullptr) {
+      ReturnFromImpl<T>::destroy(*data);
+      STABLE_TORCH_ERROR_CODE_CHECK(torch_delete_stable_ivalue(data));
+    }
+  }
+};
+
+template <typename T>
+struct ReturnFromImpl<torch::headeronly::HeaderOnlyArrayRef<T>> {
+  static StableIValue call(torch::headeronly::HeaderOnlyArrayRef<T> values) {
+    if constexpr (!contains_header_only_scalar_v<T>) {
+      return FromImpl<torch::headeronly::HeaderOnlyArrayRef<T>>::call(
+          values, aoti_torch_abi_version(), false);
+    } else {
+      StableListHandle list = nullptr;
+      STABLE_TORCH_ERROR_CODE_CHECK(
+          torch_new_list_reserve_size(values.size(), &list));
+      try {
+        for (const auto& value : values) {
+          const auto element = ReturnFromImpl<T>::call(value);
+          try {
+            STABLE_TORCH_ERROR_CODE_CHECK(torch_list_push_back(list, element));
+          } catch (...) {
+            ReturnFromImpl<T>::destroy(element);
+            throw;
+          }
+        }
+      } catch (...) {
+        destroy(from(list));
+        throw;
+      }
+      return from(list);
+    }
+  }
+
+  static void destroy(StableIValue value) {
+    auto list = to<StableListHandle>(value);
+    size_t size = 0;
+    STABLE_TORCH_ERROR_CODE_CHECK(torch_list_size(list, &size));
+    for (size_t i = 0; i < size; ++i) {
+      StableIValue element = 0;
+      STABLE_TORCH_ERROR_CODE_CHECK(torch_list_get_item(list, i, &element));
+      ReturnFromImpl<T>::destroy(element);
+    }
+    STABLE_TORCH_ERROR_CODE_CHECK(torch_delete_list(list));
+  }
+};
+
+template <typename T>
+struct ReturnFromImpl<std::vector<T>> {
+  static StableIValue call(const std::vector<T>& values) {
+    return ReturnFromImpl<torch::headeronly::HeaderOnlyArrayRef<T>>::call(
+        values);
+  }
+
+  static void destroy(StableIValue value) {
+    ReturnFromImpl<torch::headeronly::HeaderOnlyArrayRef<T>>::destroy(value);
+  }
+};
+#endif // TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
+
+template <typename T>
+StableIValue box_return(const T& value) {
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
+  return ReturnFromImpl<T>::call(value);
+#else
+  return from<T>(value);
+#endif
+}
+
 HIDDEN_NAMESPACE_END(torch, stable, detail)
 
 // [global from/to deprecation note]
@@ -1020,6 +1231,9 @@ HIDDEN_NAMESPACE_END(torch, stable, detail)
 template <typename T>
 [[deprecated("Use torch::stable::detail::from instead.")]]
 inline StableIValue from(T val) {
+  static_assert(
+      !torch::stable::detail::contains_header_only_scalar_v<T>,
+      "Use torch::stable::detail::from with a live Scalar input");
   return torch::stable::detail::from(val);
 }
 
@@ -1028,6 +1242,9 @@ inline StableIValue from(T val) {
 template <typename T>
 [[deprecated("Use torch::stable::detail::from instead.")]]
 inline StableIValue from(const std::optional<T>& val) {
+  static_assert(
+      !torch::stable::detail::contains_header_only_scalar_v<T>,
+      "Use torch::stable::detail::from with a live Scalar input");
   return torch::stable::detail::from(val);
 }
 

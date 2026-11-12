@@ -20,6 +20,143 @@
 #include <torch/csrc/shim_conversion_utils.h>
 #include <torch/csrc/shim_exception_state.h>
 #include <torch/csrc/stable/c/shim.h>
+#include <torch/headeronly/core/Scalar.h>
+
+#include <array>
+#include <new>
+#include <type_traits>
+
+struct HeaderOnlySymbolicOpaque {
+  explicit HeaderOnlySymbolicOpaque(c10::IValue symbolic)
+      : value(std::move(symbolic)) {}
+
+  HeaderOnlySymbolicOpaque(const HeaderOnlySymbolicOpaque&) = delete;
+  HeaderOnlySymbolicOpaque& operator=(const HeaderOnlySymbolicOpaque&) = delete;
+
+  c10::IValue value;
+};
+
+AOTITorchError torch_delete_symbolic_object(HeaderOnlySymbolicHandle symbolic) {
+  AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE({ delete symbolic; });
+}
+
+AOTITorchError torch_delete_header_only_scalar_object(
+    const HeaderOnlyScalarData* scalar) {
+  AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE({
+    if (scalar != nullptr &&
+        scalar->kind >= HeaderOnlyScalarData::Kind::SymInt &&
+        scalar->kind <= HeaderOnlyScalarData::Kind::SymBool &&
+        (scalar->flags & HeaderOnlyScalarData::OwnsSymbolic)) {
+      TORCH_ERROR_CODE_CHECK(
+          torch_delete_symbolic_object(scalar->value.symbolic));
+    }
+    delete scalar;
+  });
+}
+
+static void scalar_data_from_ivalue(
+    const c10::IValue& value,
+    HeaderOnlyScalarData& result) {
+  using Kind = HeaderOnlyScalarData::Kind;
+  auto* data = &result;
+  if (value.isInt()) {
+    data->kind = Kind::Int;
+    data->value.integer = value.toInt();
+  } else if (value.isUnsigned()) {
+    data->kind = Kind::UInt;
+    data->value.unsigned_integer = value.toUInt();
+  } else if (value.isDouble()) {
+    data->kind = Kind::Double;
+    data->value.floating = value.toDouble();
+  } else if (value.isBool()) {
+    data->kind = Kind::Bool;
+    data->value.integer = value.toBool();
+  } else if (value.isComplexDouble()) {
+    data->kind = Kind::Complex;
+    const auto complex = value.toComplexDouble();
+    data->value.complex = {complex.real(), complex.imag()};
+  } else {
+    TORCH_CHECK(
+        value.isSymInt() || value.isSymFloat() || value.isSymBool(),
+        "Expected a numeric or symbolic Scalar");
+    data->kind = value.isSymInt() ? Kind::SymInt
+        : value.isSymFloat()      ? Kind::SymFloat
+                                  : Kind::SymBool;
+    data->value.symbolic = new HeaderOnlySymbolicOpaque(value);
+    data->flags = HeaderOnlyScalarData::OwnsSymbolic;
+  }
+}
+
+// Common input arities use stack storage. Overflow blocks keep nested-list
+// element addresses stable without allocating an object for each Scalar.
+class ScalarInputArena {
+ public:
+  HeaderOnlyScalarData* add(const c10::IValue& value) {
+    HeaderOnlyScalarData* data;
+    if (size_ < kBlockSize) {
+      data = new (&inline_[size_]) HeaderOnlyScalarData{};
+    } else {
+      const auto index = size_ - kBlockSize;
+      if (index / kBlockSize == overflow_.size()) {
+        overflow_.push_back(std::make_unique<Block>());
+      }
+      data = &(*overflow_[index / kBlockSize])[index % kBlockSize];
+    }
+    scalar_data_from_ivalue(value, *data);
+    ++size_;
+    return data;
+  }
+
+  ~ScalarInputArena() {
+    for (size_t i = 0; i < size_; ++i) {
+      const auto& data = i < kBlockSize
+          ? *std::launder(reinterpret_cast<HeaderOnlyScalarData*>(&inline_[i]))
+          : (*overflow_[(i - kBlockSize) / kBlockSize])
+                [(i - kBlockSize) % kBlockSize];
+      if (data.kind >= HeaderOnlyScalarData::Kind::SymInt &&
+          data.kind <= HeaderOnlyScalarData::Kind::SymBool &&
+          (data.flags & HeaderOnlyScalarData::OwnsSymbolic) &&
+          data.value.symbolic != nullptr) {
+        TORCH_ERROR_CODE_CHECK(
+            torch_delete_symbolic_object(data.value.symbolic));
+      }
+    }
+  }
+
+ private:
+  static constexpr size_t kBlockSize = 8;
+  using Block = std::array<HeaderOnlyScalarData, kBlockSize>;
+  using Storage = std::aligned_storage_t<
+      sizeof(HeaderOnlyScalarData),
+      alignof(HeaderOnlyScalarData)>;
+  std::array<Storage, kBlockSize> inline_;
+  std::vector<std::unique_ptr<Block>> overflow_;
+  size_t size_ = 0;
+};
+
+static c10::IValue scalar_data_to_ivalue(const HeaderOnlyScalarData* data) {
+  using Kind = HeaderOnlyScalarData::Kind;
+  switch (data->kind) {
+    case Kind::Int:
+      return c10::IValue(data->value.integer);
+    case Kind::UInt:
+      return c10::IValue(data->value.unsigned_integer);
+    case Kind::Double:
+      return c10::IValue(data->value.floating);
+    case Kind::Bool:
+      return c10::IValue(static_cast<bool>(data->value.integer));
+    case Kind::Complex:
+      return c10::IValue(c10::complex<double>(
+          data->value.complex.real, data->value.complex.imag));
+    case Kind::SymInt:
+    case Kind::SymFloat:
+    case Kind::SymBool:
+      TORCH_CHECK(
+          data->value.symbolic != nullptr, "Expected a symbolic object");
+      return data->value.symbolic->value;
+  }
+  TORCH_CHECK(false, "Unknown Scalar kind");
+}
 
 AOTITorchError torch_new_list_reserve_size(size_t size, StableListHandle* ret) {
   auto list_ptr = std::make_unique<std::vector<StableIValue>>();
@@ -77,7 +214,8 @@ torch_delete_list(StableListHandle list_handle) {
 static StableIValue from_ivalue(
     const c10::TypePtr& type,
     const c10::IValue& ivalue,
-    uint64_t extension_build_version) {
+    uint64_t extension_build_version,
+    ScalarInputArena* scalar_inputs = nullptr) {
   switch (type->kind()) {
     case c10::TypeKind::TensorType: {
       AtenTensorHandle ath = torch::aot_inductor::new_tensor_handle(
@@ -91,6 +229,19 @@ static StableIValue from_ivalue(
     case c10::TypeKind::FloatType: {
       return torch::stable::detail::_from(
           ivalue.toDouble(), extension_build_version);
+    }
+    case c10::TypeKind::NumberType: {
+      if (scalar_inputs != nullptr) {
+        return torch::stable::detail::_from(
+            scalar_inputs->add(ivalue), extension_build_version);
+      }
+      auto data = std::make_unique<HeaderOnlyScalarData>();
+      scalar_data_from_ivalue(ivalue, *data);
+      data->destroy = [](const HeaderOnlyScalarData* scalar) {
+        TORCH_ERROR_CODE_CHECK(torch_delete_header_only_scalar_object(scalar));
+      };
+      return torch::stable::detail::_from(
+          data.release(), extension_build_version);
     }
     case c10::TypeKind::BoolType: {
       return torch::stable::detail::_from(
@@ -148,8 +299,8 @@ static StableIValue from_ivalue(
         return torch::stable::detail::_from(
             std::nullopt, extension_build_version);
       }
-      const StableIValue value =
-          from_ivalue(inner_type, ivalue, extension_build_version);
+      const StableIValue value = from_ivalue(
+          inner_type, ivalue, extension_build_version, scalar_inputs);
       StableIValue* sivp = nullptr;
       TORCH_ERROR_CODE_CHECK(torch_new_stable_ivalue(&sivp));
       *sivp = value;
@@ -161,8 +312,8 @@ static StableIValue from_ivalue(
       auto stableivalue_list = std::make_unique<std::vector<StableIValue>>();
       stableivalue_list->reserve(ivalue_list.size());
       for (const auto& elem : ivalue_list) {
-        stableivalue_list->emplace_back(
-            from_ivalue(inner_type, elem, extension_build_version));
+        stableivalue_list->emplace_back(from_ivalue(
+            inner_type, elem, extension_build_version, scalar_inputs));
       }
       return torch::stable::detail::_from(
           list_pointer_to_list_handle(stableivalue_list.release()),
@@ -206,6 +357,21 @@ static c10::IValue to_ivalue(
     case c10::TypeKind::FloatType: {
       return c10::IValue(torch::stable::detail::_to<double>(
           stable_ivalue, extension_build_version));
+    }
+    case c10::TypeKind::NumberType: {
+      const auto* data =
+          torch::stable::detail::_to<const HeaderOnlyScalarData*>(
+              stable_ivalue, extension_build_version);
+      TORCH_CHECK(data != nullptr, "Expected non-null Scalar data");
+      auto owner = std::unique_ptr<
+          const HeaderOnlyScalarData,
+          void (*)(const HeaderOnlyScalarData*)>(
+          data, [](const HeaderOnlyScalarData* scalar) {
+            if (scalar->destroy != nullptr) {
+              scalar->destroy(scalar);
+            }
+          });
+      return scalar_data_to_ivalue(data);
     }
     case c10::TypeKind::BoolType: {
       return c10::IValue(torch::stable::detail::_to<bool>(
@@ -325,6 +491,7 @@ class StableIValueBoxedKernel : public c10::OperatorKernel {
     const auto& schema = op.schema();
     const auto num_returns = schema.returns().size();
     const auto num_arguments = schema.arguments().size();
+    ScalarInputArena scalar_inputs;
 
     auto ministack =
         std::make_unique<StableIValue[]>(std::max(num_arguments, num_returns));
@@ -334,7 +501,10 @@ class StableIValueBoxedKernel : public c10::OperatorKernel {
       const c10::TypePtr& arg_type =
           schema.arguments()[ministack_idx].real_type();
       ministack[ministack_idx] = from_ivalue(
-          arg_type, torch::jit::pop(stack), extension_build_version_);
+          arg_type,
+          torch::jit::pop(stack),
+          extension_build_version_,
+          &scalar_inputs);
     }
 
     // boxed function is going to take a stack of StableIValues, cast them to

@@ -1275,6 +1275,140 @@ for warning in w:
             enabled = libtorch_agnostic.ops.my_is_warn_always_enabled()
         self.assertEqual(enabled, warn_always)
 
+    @skipIfTorchVersionLessThan(2, 16)
+    @onlyCPU
+    @parametrize(
+        "value",
+        [False, True, 0, 2**63 - 1, -(2**63), 2**63, 2**64 - 1, 1.25, -0.0, 1.5 - 2.5j],
+    )
+    def test_scalar(self, device, value):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        ops = libtorch_agnostic.ops
+        result = ops.my_scalar_identity(value)
+        self.assertEqual(result, value)
+        self.assertIs(type(result), type(value))
+        self.assertTrue(ops.my_scalar_borrowed(value))
+        for op in (ops.my_scalar_copy, ops.my_scalar_dispatch):
+            result = op(value)
+            self.assertEqual(result, value)
+            self.assertIs(type(result), type(value))
+        self.assertEqual(
+            ops.my_scalar_kind(value),
+            tuple(type(value) is kind for kind in (bool, int, float, complex)),
+        )
+        if isinstance(value, complex):
+            result = ops.my_scalar_from_complex(value.real, value.imag)
+        elif type(value) is int and value > 2**63 - 1:
+            result = ops.my_scalar_from_uint(value >> 32, value & 0xFFFFFFFF)
+        else:
+            name = {bool: "bool", int: "int", float: "double"}[type(value)]
+            result = getattr(ops, f"my_scalar_from_{name}")(value)
+        self.assertEqual(result, value)
+        self.assertIs(type(result), type(value))
+        expected = complex(value)
+        self.assertEqual(
+            ops.my_scalar_to_complex(value), (expected.real, expected.imag)
+        )
+        if isinstance(value, complex) or (type(value) is int and value > 2**63 - 1):
+            with self.assertRaises(RuntimeError):
+                ops.my_scalar_to_real(value)
+        else:
+            expected = (int(value), float(value), bool(value))
+            self.assertEqual(ops.my_scalar_to_real(value), expected)
+
+    @skipIfTorchVersionLessThan(2, 16)
+    @onlyCPU
+    @parametrize("repeat", [0, 1, 9])
+    def test_scalar_list(self, device, repeat):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        values = [True, 2**64 - 1, 1.25, 1.5 - 2.5j] * repeat
+        result = libtorch_agnostic.ops.my_scalar_list(values)
+        self.assertEqual(result, values)
+        self.assertEqual(
+            [type(value) for value in result], [type(value) for value in values]
+        )
+
+    @skipIfTorchVersionLessThan(2, 16)
+    @onlyCPU
+    @parametrize("value", [None, True, 2**64 - 1, 1.25, 1.5 - 2.5j])
+    def test_scalar_optional(self, device, value):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        result = libtorch_agnostic.ops.my_scalar_optional(value)
+        self.assertEqual(result, value)
+        self.assertIs(type(result), type(value))
+
+    @skipIfTorchVersionLessThan(2, 16)
+    @onlyCPU
+    def test_scalar_numeric_types(self, device):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        self.assertTrue(libtorch_agnostic.ops.my_scalar_numeric_types())
+
+    @skipIfTorchVersionLessThan(2, 16)
+    @onlyCPU
+    @parametrize("kind", ["int", "float", "bool"])
+    def test_scalar_symbolic(self, device, kind):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        ops = libtorch_agnostic.ops
+        env = ShapeEnv()
+        value = getattr(env, f"create_unbacked_sym{kind}")()
+        self.assertEqual(
+            ops.my_scalar_symbolic_kind(value),
+            tuple(kind == name for name in ("int", "float", "bool")),
+        )
+        self.assertTrue(ops.my_scalar_borrowed(value))
+        for op in (
+            ops.my_scalar_identity,
+            ops.my_scalar_copy,
+            ops.my_scalar_dispatch,
+            ops.my_scalar_optional,
+        ):
+            result = op(value)
+            self.assertIs(type(result), type(value))
+            self.assertEqual(result.node.expr, value.node.expr)
+        result, rejects_borrow, transferred, rejects_second = ops.my_scalar_transfer(
+            value
+        )
+        self.assertIs(type(result), type(value))
+        self.assertEqual(result.node.expr, value.node.expr)
+        self.assertTrue(rejects_borrow)
+        self.assertTrue(transferred)
+        self.assertTrue(rejects_second)
+        with self.assertRaisesRegex(RuntimeError, "test scalar failure"):
+            ops.my_scalar_throw(value)
+        result = ops.my_scalar_list([value] * 20)
+        self.assertEqual([item.node.expr for item in result], [value.node.expr] * 20)
+        with self.assertRaisesRegex(RuntimeError, "cannot be converted to concrete"):
+            ops.my_scalar_to_real(value)
+        self.assertEqual(len(env.guards), 0)
+
+    @skipIfTorchVersionLessThan(2, 16)
+    @parametrize("alpha", [True, 2, 2.5, 1.5 - 2.5j])
+    def test_scalar_add_item(self, device, alpha):
+        import libtorch_agn_2_16 as libtorch_agnostic
+
+        dtypes = {
+            bool: torch.bool,
+            int: torch.int64,
+            float: torch.float64,
+            complex: torch.complex128,
+        }
+        dtype = dtypes[type(alpha)]
+        x = torch.ones(2, device=device, dtype=dtype)
+        y = torch.ones_like(x)
+        result = libtorch_agnostic.ops.my_scalar_add(x, y, alpha)
+        self.assertEqual(result, torch.add(x, y, alpha=alpha))
+        t = torch.tensor(alpha, device=device, dtype=dtype)
+        result = libtorch_agnostic.ops.my_scalar_item(t)
+        self.assertEqual(result, alpha)
+        self.assertIs(type(result), type(alpha))
+
     @skipIfTorchVersionLessThan(2, 10)
     @parametrize("layout", [None, torch.strided, torch.sparse_coo])
     @parametrize("memory_format", [None, torch.channels_last, torch.contiguous_format])
