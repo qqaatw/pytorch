@@ -4,9 +4,9 @@
 #include <torch/headeronly/util/Exception.h>
 #include <torch/headeronly/util/TypeCast.h>
 
+#include <torch/csrc/stable/macros.h>
 #include <cstdint>
 #include <limits>
-#include <memory>
 #include <type_traits>
 #include <utility>
 
@@ -15,6 +15,10 @@ struct HeaderOnlySymbolicOpaque;
 // This layout is shared across the stable ABI. Numeric values are stored
 // inline; symbolic pointers refer to objects owned by libtorch.
 struct HeaderOnlyScalarData {
+  HeaderOnlyScalarData() = default;
+  HeaderOnlyScalarData(const HeaderOnlyScalarData&) = delete;
+  HeaderOnlyScalarData& operator=(const HeaderOnlyScalarData&) = delete;
+
   enum class Kind : uint32_t {
     Int,
     UInt,
@@ -47,7 +51,7 @@ struct HeaderOnlyScalarData {
 };
 
 static_assert(std::is_standard_layout_v<HeaderOnlyScalarData>);
-static_assert(std::is_trivially_copyable_v<HeaderOnlyScalarData>);
+static_assert(!std::is_copy_constructible_v<HeaderOnlyScalarData>);
 
 HIDDEN_NAMESPACE_BEGIN(torch, headeronly)
 
@@ -57,21 +61,42 @@ class HeaderOnlyScalar {
 
   HeaderOnlyScalar() = default;
 
-  HeaderOnlyScalar(const HeaderOnlyScalar&) = default;
-  HeaderOnlyScalar& operator=(const HeaderOnlyScalar&) = default;
+  HeaderOnlyScalar(const HeaderOnlyScalar& other) {
+    copy_payload(other.data_);
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
+    if (isSymbolic()) {
+      STABLE_TORCH_ERROR_CODE_CHECK(
+          torch_retain_symbolic_object(data_.value.symbolic));
+    }
+#endif
+  }
 
-  HeaderOnlyScalar(HeaderOnlyScalar&& other) noexcept
-      : data_(other.data_), symbolic_(std::move(other.symbolic_)) {
-    other.data_ = {};
+  HeaderOnlyScalar& operator=(const HeaderOnlyScalar& other) {
+    if (this != &other) {
+      HeaderOnlyScalar copy(other);
+      *this = std::move(copy);
+    }
+    return *this;
+  }
+
+  HeaderOnlyScalar(HeaderOnlyScalar&& other) noexcept {
+    copy_payload(other.data_);
+    other.data_.kind = Kind::Int;
+    other.data_.value.integer = 0;
   }
 
   HeaderOnlyScalar& operator=(HeaderOnlyScalar&& other) noexcept {
     if (this != &other) {
-      data_ = other.data_;
-      symbolic_ = std::move(other.symbolic_);
-      other.data_ = {};
+      reset();
+      copy_payload(other.data_);
+      other.data_.kind = Kind::Int;
+      other.data_.value.integer = 0;
     }
     return *this;
+  }
+
+  ~HeaderOnlyScalar() {
+    reset();
   }
 
   template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
@@ -112,25 +137,26 @@ class HeaderOnlyScalar {
         static_cast<double>(value.real()), static_cast<double>(value.imag())};
   }
 
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
   static HeaderOnlyScalar fromSymbolic(
       Kind kind,
-      std::shared_ptr<HeaderOnlySymbolicOpaque> owner) {
+      HeaderOnlySymbolicOpaque* owner) {
     STD_TORCH_CHECK(
         kind == Kind::SymInt || kind == Kind::SymFloat || kind == Kind::SymBool,
         "Expected a symbolic Scalar kind");
     STD_TORCH_CHECK(owner != nullptr, "Expected a non-null symbolic Scalar");
     HeaderOnlyScalar result;
     result.data_.kind = kind;
-    result.data_.value.symbolic = owner.get();
-    result.symbolic_ = std::move(owner);
+    result.data_.value.symbolic = owner;
     return result;
   }
+#endif
 
   static HeaderOnlyScalar fromData(const HeaderOnlyScalarData& data) {
     STD_TORCH_CHECK(
         data.kind <= Kind::Complex, "Symbolic Scalar data requires an owner");
     HeaderOnlyScalar result;
-    result.data_ = data;
+    result.copy_payload(data);
     result.data_.flags = 0;
     result.data_.destroy = nullptr;
     return result;
@@ -138,10 +164,6 @@ class HeaderOnlyScalar {
 
   const HeaderOnlyScalarData& data() const {
     return data_;
-  }
-
-  const std::shared_ptr<HeaderOnlySymbolicOpaque>& symbolicOwner() const {
-    return symbolic_;
   }
 
   bool isSymInt() const {
@@ -238,7 +260,21 @@ class HeaderOnlyScalar {
 
  private:
   HeaderOnlyScalarData data_;
-  std::shared_ptr<HeaderOnlySymbolicOpaque> symbolic_;
+  void copy_payload(const HeaderOnlyScalarData& data) {
+    data_.kind = data.kind;
+    data_.value = data.value;
+  }
+
+  void reset() noexcept {
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
+    if (isSymbolic()) {
+      if (torch_delete_symbolic_object(data_.value.symbolic) !=
+          AOTI_TORCH_SUCCESS) {
+        std::terminate();
+      }
+    }
+#endif
+  }
 };
 
 HIDDEN_NAMESPACE_END(torch, headeronly)

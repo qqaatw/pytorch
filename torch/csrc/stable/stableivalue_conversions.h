@@ -719,11 +719,7 @@ struct ToImpl<torch::headeronly::HeaderOnlyScalar> {
           data->value.symbolic != nullptr,
           "Symbolic Scalar ownership was already transferred");
       auto* handle = std::exchange(data->value.symbolic, nullptr);
-      auto symbolic = std::shared_ptr<HeaderOnlySymbolicOpaque>(
-          handle, [](HeaderOnlySymbolicOpaque* owned) {
-            STABLE_TORCH_ERROR_CODE_CHECK(torch_delete_symbolic_object(owned));
-          });
-      return Scalar::fromSymbolic(data->kind, std::move(symbolic));
+      return Scalar::fromSymbolic(data->kind, handle);
     }
     return Scalar::fromData(*data);
   }
@@ -1102,18 +1098,23 @@ struct ReturnFromImpl {
   }
 };
 
-struct OwnedScalarData : HeaderOnlyScalarData {
-  std::shared_ptr<HeaderOnlySymbolicOpaque> symbolic;
-};
-
 template <>
 struct ReturnFromImpl<torch::headeronly::HeaderOnlyScalar> {
   static StableIValue call(const torch::headeronly::HeaderOnlyScalar& value) {
-    auto data = std::make_unique<OwnedScalarData>();
-    static_cast<HeaderOnlyScalarData&>(*data) = value.data();
-    data->symbolic = value.symbolicOwner();
+    auto data = std::make_unique<HeaderOnlyScalarData>();
+    data->kind = value.data().kind;
+    data->value = value.data().value;
+    if (value.isSymbolic()) {
+      STABLE_TORCH_ERROR_CODE_CHECK(
+          torch_retain_symbolic_object(data->value.symbolic));
+      data->flags = HeaderOnlyScalarData::OwnsSymbolic;
+    }
     data->destroy = [](const HeaderOnlyScalarData* scalar) {
-      delete static_cast<const OwnedScalarData*>(scalar);
+      if (scalar->flags & HeaderOnlyScalarData::OwnsSymbolic) {
+        STABLE_TORCH_ERROR_CODE_CHECK(
+            torch_delete_symbolic_object(scalar->value.symbolic));
+      }
+      delete scalar;
     };
     return from(static_cast<const HeaderOnlyScalarData*>(data.release()));
   }

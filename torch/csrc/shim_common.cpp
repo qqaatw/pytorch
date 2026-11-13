@@ -26,7 +26,7 @@
 #include <new>
 #include <type_traits>
 
-struct HeaderOnlySymbolicOpaque {
+struct HeaderOnlySymbolicOpaque : c10::intrusive_ptr_target {
   explicit HeaderOnlySymbolicOpaque(c10::IValue symbolic)
       : value(std::move(symbolic)) {}
 
@@ -36,8 +36,17 @@ struct HeaderOnlySymbolicOpaque {
   c10::IValue value;
 };
 
+AOTITorchError torch_retain_symbolic_object(HeaderOnlySymbolicHandle symbolic) {
+  AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE(
+      { c10::raw::intrusive_ptr::incref(symbolic); });
+}
+
 AOTITorchError torch_delete_symbolic_object(HeaderOnlySymbolicHandle symbolic) {
-  AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE({ delete symbolic; });
+  AOTI_TORCH_CONVERT_EXCEPTION_TO_ERROR_CODE({
+    if (symbolic != nullptr) {
+      c10::raw::intrusive_ptr::decref(symbolic);
+    }
+  });
 }
 
 AOTITorchError torch_delete_header_only_scalar_object(
@@ -82,7 +91,8 @@ static void scalar_data_from_ivalue(
     data->kind = value.isSymInt() ? Kind::SymInt
         : value.isSymFloat()      ? Kind::SymFloat
                                   : Kind::SymBool;
-    data->value.symbolic = new HeaderOnlySymbolicOpaque(value);
+    data->value.symbolic =
+        c10::make_intrusive<HeaderOnlySymbolicOpaque>(value).release();
     data->flags = HeaderOnlyScalarData::OwnsSymbolic;
   }
 }

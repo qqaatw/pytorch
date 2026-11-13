@@ -19,6 +19,12 @@ struct CanPackScalar<
     std::void_t<decltype(torch::stable::detail::from(std::declval<T>()))>>
     : std::true_type {};
 
+static_assert(!std::is_copy_constructible_v<HeaderOnlyScalarData>);
+static_assert(!std::is_copy_assignable_v<HeaderOnlyScalarData>);
+static_assert(std::is_copy_constructible_v<Scalar>);
+static_assert(std::is_copy_assignable_v<Scalar>);
+static_assert(std::is_nothrow_move_constructible_v<Scalar>);
+static_assert(std::is_nothrow_move_assignable_v<Scalar>);
 static_assert(CanPackScalar<const Scalar&>::value);
 static_assert(!CanPackScalar<Scalar&&>::value);
 static_assert(!CanPackScalar<std::optional<Scalar>&&>::value);
@@ -28,10 +34,32 @@ Scalar my_scalar_identity(Scalar value) {
   return value;
 }
 
-Scalar my_scalar_copy(Scalar value) {
+Scalar my_scalar_copy_move(Scalar value) {
   Scalar copy = value;
+  Scalar& alias = copy;
+  copy = alias;
+  copy = std::move(alias);
+  Scalar assigned(value);
+  assigned = copy;
+  Scalar moved(std::move(assigned));
+  STD_TORCH_CHECK(assigned.isIntegral(false) && assigned.toLong() == 0, "Move must clear the source");
+  assigned = value;
+  assigned = std::move(moved);
+  STD_TORCH_CHECK(moved.isIntegral(false) && moved.toLong() == 0, "Move assignment must clear the source");
   value = Scalar();
-  return copy;
+  copy = Scalar();
+  return assigned;
+}
+
+Scalar my_scalar_assign(Scalar source, Scalar destination, bool move) {
+  if (move) {
+    destination = std::move(source);
+    STD_TORCH_CHECK(source.isIntegral(false) && source.toLong() == 0,
+                    "Move assignment must clear the source");
+  } else {
+    destination = source;
+  }
+  return destination;
 }
 
 std::tuple<bool, bool, bool> my_scalar_symbolic_kind(Scalar value) {
@@ -55,9 +83,9 @@ bool my_scalar_borrowed(Scalar value) {
       !(data->flags & HeaderOnlyScalarData::OwnsSymbolic);
 }
 
-std::tuple<Scalar, bool, bool, bool> my_scalar_transfer(Scalar value) {
+Scalar my_scalar_transfer(Scalar value) {
   STD_TORCH_CHECK(value.isSymbolic(), "Expected a symbolic Scalar");
-  auto* original = value.symbolicOwner().get();
+  auto* original = value.data().value.symbolic;
   bool rejects_borrow = false;
   try {
     auto invalid = torch::stable::detail::to<Scalar>(
@@ -65,7 +93,9 @@ std::tuple<Scalar, bool, bool, bool> my_scalar_transfer(Scalar value) {
   } catch (const std::runtime_error& error) {
     rejects_borrow = std::string(error.what()).find("borrowed") != std::string::npos;
   }
-  rejects_borrow = rejects_borrow && value.data().value.symbolic == original;
+  STD_TORCH_CHECK(rejects_borrow, "Borrowed symbolic records must reject adoption");
+  STD_TORCH_CHECK(value.data().value.symbolic == original,
+                  "Rejected adoption must preserve the borrowed handle");
 
   std::array<StableIValue, 1> stack{torch::stable::detail::from(value)};
   STABLE_TORCH_ERROR_CODE_CHECK(torch_call_dispatcher(
@@ -79,9 +109,10 @@ std::tuple<Scalar, bool, bool, bool> my_scalar_transfer(Scalar value) {
       data, data->destroy);
   data->destroy = nullptr;
   Scalar adopted = torch::stable::detail::to<Scalar>(stack[0]);
-  bool transferred = data->value.symbolic == nullptr;
+  STD_TORCH_CHECK(data->value.symbolic == nullptr, "Adoption must clear the record handle");
   Scalar copy = adopted;
-  transferred = transferred && copy.symbolicOwner().get() == adopted.symbolicOwner().get();
+  STD_TORCH_CHECK(copy.data().value.symbolic == adopted.data().value.symbolic,
+                  "Scalar copies must retain the same symbolic handle");
   adopted = Scalar();
 
   bool rejects_second = false;
@@ -90,7 +121,8 @@ std::tuple<Scalar, bool, bool, bool> my_scalar_transfer(Scalar value) {
   } catch (const std::runtime_error& error) {
     rejects_second = std::string(error.what()).find("already transferred") != std::string::npos;
   }
-  return {std::move(copy), rejects_borrow, transferred, rejects_second};
+  STD_TORCH_CHECK(rejects_second, "Symbolic records must reject a second adoption");
+  return copy;
 }
 
 void my_scalar_throw(Scalar value) {
@@ -103,10 +135,10 @@ bool my_scalar_numeric_types() {
   {                                                                     \
     const type value = c10::convert<type>(1.0);                          \
     const Scalar scalar(value);                                         \
-    if (scalar.toDouble() != 1.0 ||                                     \
-        c10::convert<double>(scalar.to<type>()) != 1.0) {                \
-      return false;                                                     \
-    }                                                                   \
+    STD_TORCH_CHECK(                                                     \
+        scalar.toDouble() == 1.0 &&                                      \
+            c10::convert<double>(scalar.to<type>()) == 1.0,               \
+        "Scalar conversion failed for ", #name);                        \
   }
   AT_FORALL_SCALAR_TYPES_WITH_COMPLEX(CHECK_SCALAR_TYPE)
   CHECK_SCALAR_TYPE(uint16_t, UInt16)
@@ -181,11 +213,12 @@ Scalar my_scalar_item(Tensor self) {
 
 STABLE_TORCH_LIBRARY_FRAGMENT(STABLE_LIB_NAME, m) {
   m.def("my_scalar_identity(Scalar value) -> Scalar");
-  m.def("my_scalar_copy(Scalar value) -> Scalar");
+  m.def("my_scalar_assign(Scalar source, Scalar destination, bool move) -> Scalar");
+  m.def("my_scalar_copy_move(Scalar value) -> Scalar");
   m.def("my_scalar_symbolic_kind(Scalar value) -> (bool, bool, bool)");
   m.def("my_scalar_dispatch(Scalar value) -> Scalar");
   m.def("my_scalar_borrowed(Scalar value) -> bool");
-  m.def("my_scalar_transfer(Scalar value) -> (Scalar, bool, bool, bool)");
+  m.def("my_scalar_transfer(Scalar value) -> Scalar");
   m.def("my_scalar_throw(Scalar value) -> ()");
   m.def("my_scalar_numeric_types() -> bool");
   m.def("my_scalar_list(Scalar[] values) -> Scalar[]");
@@ -204,7 +237,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(STABLE_LIB_NAME, m) {
 
 STABLE_TORCH_LIBRARY_IMPL(STABLE_LIB_NAME, CompositeExplicitAutograd, m) {
   m.impl("my_scalar_identity", TORCH_BOX(&my_scalar_identity));
-  m.impl("my_scalar_copy", TORCH_BOX(&my_scalar_copy));
+  m.impl("my_scalar_assign", TORCH_BOX(&my_scalar_assign));
+  m.impl("my_scalar_copy_move", TORCH_BOX(&my_scalar_copy_move));
   m.impl("my_scalar_symbolic_kind", TORCH_BOX(&my_scalar_symbolic_kind));
   m.impl("my_scalar_dispatch", TORCH_BOX(&my_scalar_dispatch));
   m.impl("my_scalar_borrowed", TORCH_BOX(&my_scalar_borrowed));

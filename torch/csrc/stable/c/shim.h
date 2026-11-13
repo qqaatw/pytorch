@@ -391,7 +391,10 @@ using HeaderOnlySymbolicHandle = HeaderOnlySymbolicOpaque*;
 // Objects are released in the module that allocated them.
 AOTI_TORCH_EXPORT AOTITorchError
 torch_delete_header_only_scalar_object(const HeaderOnlyScalarData* scalar);
-// Consumes an owning handle. Scalar copies share ownership in the extension.
+// Retains an owning reference to an existing symbolic object.
+AOTI_TORCH_EXPORT AOTITorchError
+torch_retain_symbolic_object(HeaderOnlySymbolicHandle symbolic);
+// Releases an owning reference; destroys the object on the last release.
 AOTI_TORCH_EXPORT AOTITorchError
 torch_delete_symbolic_object(HeaderOnlySymbolicHandle symbolic);
 
